@@ -1,6 +1,9 @@
+"use strict";
+
 /**
  * ============================================
- * BOT WHATSAPP KEUANGAN PRIBADI
+ *  PENGELUARAN BOT WA — FINAL STABLE VERSION
+ *  Target: GitHub Codespaces / Cloud Gratis
  * ============================================
  */
 
@@ -10,324 +13,257 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  fetchLatestBaileysVersion,
 } = require("baileys");
 
-const Pino = require("pino");
+const pino = require("pino");
 const qrcode = require("qrcode-terminal");
 const schedule = require("node-schedule");
+const os = require("os");
+const axios = require("axios");
 const dayjs = require("dayjs");
-const utc = require("dayjs/plugin/utc");
-const timezone = require("dayjs/plugin/timezone");
-
-dayjs.extend(utc);
-dayjs.extend(timezone);
-
-const TZ = "Asia/Jakarta";
-
-/* ================= GOOGLE SHEET ================= */
+const fs = require("fs");
 
 const {
+  initDoc,
   appendTransaksi,
+  getTotalPengeluaranBulanIni,
   laporanHariIni,
   hapusTransaksiRow,
   setIncome,
   getIncomeData,
-  getTotalPengeluaranBulanIni,
 } = require("./googleSheet");
 
-/* ================= CONFIG ================= */
+/* ======================================================
+ * ENV CHECK — WAJIB
+ * ====================================================== */
+console.log("🔐 ENV CHECK (startup):", {
+  GOOGLE_SHEET_ID: !!process.env.GOOGLE_SHEET_ID,
+  GOOGLE_SERVICE_ACCOUNT_EMAIL: !!process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+  GOOGLE_PRIVATE_KEY: !!process.env.GOOGLE_PRIVATE_KEY,
+  OWNER_JID: !!process.env.OWNER_JID,
+});
 
-const OWNER_JID = process.env.OWNER_JID;
-const DEBUG = process.env.DEBUG === "true";
-
-/* ================= UTIL ================= */
-
-function log(...args) {
-  if (DEBUG) console.log("[DEBUG]", ...args);
+if (
+  !process.env.GOOGLE_SHEET_ID ||
+  !process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ||
+  !process.env.GOOGLE_PRIVATE_KEY
+) {
+  console.error("❌ ENV tidak lengkap. Bot dihentikan.");
+  process.exit(1);
 }
 
-function formatRupiah(num) {
-  return "Rp" + Number(num).toLocaleString("id-ID");
+/* ======================================================
+ * HELPER
+ * ====================================================== */
+function ensureAuthDir() {
+  if (!fs.existsSync("./auth")) {
+    fs.mkdirSync("./auth");
+  }
 }
 
-function isOwner(sender) {
-  return sender === OWNER_JID;
+/* ======================================================
+ * BROADCAST REMINDER
+ * ====================================================== */
+async function broadcastReminderPengeluaran(sock) {
+  try {
+    const doc = await initDoc();
+    const sheet = doc.sheetsByTitle["Income"];
+    if (!sheet) return;
+
+    const rows = await sheet.getRows();
+    const today = dayjs().format("YYYY-MM-DD");
+    const bulanIni = dayjs().format("YYYY-MM");
+    const sudah = new Set();
+
+    for (const row of rows) {
+      const user = row.User || row._rawData?.[0];
+      const bulan = row.BulanAwal || row._rawData?.[1];
+
+      if (!user || bulan !== bulanIni || sudah.has(user)) continue;
+
+      const transaksi = await laporanHariIni(user, today);
+      if (transaksi.length === 0) {
+        await sock.sendMessage(user, {
+          text:
+            `👋 Hai!\n\n` +
+            `Kamu belum mencatat pengeluaran hari ini (${dayjs().format("DD/MM/YYYY")}).\n\n` +
+            `Contoh:\n` +
+            `+ngopi 15000 kopi susu`,
+        });
+        sudah.add(user);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Broadcast error:", err.message);
+  }
 }
 
-/* ================= BOT INIT ================= */
-
+/* ======================================================
+ * START BOT
+ * ====================================================== */
 async function startBot() {
+  console.log("🚀 Bot starting...");
+
+  ensureAuthDir();
+
   const { state, saveCreds } = await useMultiFileAuthState("auth");
+  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
+    version,
     auth: state,
-    printQRInTerminal: false,
-    logger: Pino({ level: "silent" }),
+    logger: pino({ level: "info" }),
+    browser: ["PengeluaranBot", "Codespaces", "1.0"],
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
 
+  /* ================= CONNECTION ================= */
   sock.ev.on("connection.update", (update) => {
+    console.log("🔄 connection.update:", update.connection || update.qr ? "event" : update);
+
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      console.log("📱 QR DIDAPATKAN — SCAN SEKARANG");
       qrcode.generate(qr, { small: true });
     }
 
-    if (connection === "close") {
-      const reason = lastDisconnect?.error?.output?.statusCode;
-      if (reason !== DisconnectReason.loggedOut) {
-        startBot();
-      } else {
-        console.log("❌ Logged out. Hapus folder auth.");
-      }
+    if (connection === "open") {
+      console.log("✅ WhatsApp Connected");
     }
 
-    if (connection === "open") {
-      console.log("✅ Bot WhatsApp aktif");
+    if (connection === "close") {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      console.log("❌ Connection closed:", code);
+
+      if (code !== DisconnectReason.loggedOut) {
+        console.log("🔁 Reconnecting...");
+        startBot();
+      } else {
+        console.log("⚠️ Logged out. Hapus folder auth untuk login ulang.");
+      }
     }
   });
 
   /* ================= MESSAGE HANDLER ================= */
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg?.message || msg.key.fromMe) return;
+
+    const sender = msg.key.remoteJid;
+    const text =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      "";
+
     try {
-      const msg = messages[0];
-      if (!msg.message || msg.key.fromMe) return;
-
-      const sender = msg.key.remoteJid;
-      if (!isOwner(sender)) return;
-
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        "";
-
-      const input = text.trim();
-      const lower = input.toLowerCase();
-
-      log("CMD:", input);
-
-      /* ===== HELP ===== */
-
-      if (lower === "help") {
-        return sock.sendMessage(sender, {
+      /* ---------- HELP ---------- */
+      if (["help", "menu", "panduan", "?"].includes(text.toLowerCase())) {
+        await sock.sendMessage(sender, {
           text:
-`📌 *Perintah Bot Keuangan*
-
-➕ tambah <kategori> <nominal> <opsional deskripsi>
-↩️ refund <nominal>
-📊 hari ini
-📈 bulan ini
-💰 set income <income> <target>
-📉 analisis boros
-
-Contoh:
-tambah makan 25000 nasi goreng`,
+            `📘 *Panduan Bot Pengeluaran*\n\n` +
+            `+kategori jumlah deskripsi\n` +
+            `Contoh: +ngopi 15000 kopi susu\n\n` +
+            `ringkasan\nringkasan 3\nringkasan 05-06\n\n` +
+            `hapus pengeluaran\nhapus pengeluaran 05-06\n\n` +
+            `set income 5000000 tabungan 1000000\n` +
+            `progress tabungan`,
         });
-      }
-
-      /* ===== SET INCOME ===== */
-
-      if (lower.startsWith("set income")) {
-        const parts = input.split(" ");
-        if (parts.length < 4) {
-          return sock.sendMessage(sender, {
-            text: "❌ Format: set income <income> <target>",
-          });
-        }
-
-        const income = Number(parts[2]);
-        const target = Number(parts[3]);
-
-        if (isNaN(income) || isNaN(target)) {
-          return sock.sendMessage(sender, {
-            text: "❌ Income & target harus angka",
-          });
-        }
-
-        await setIncome(sender, income, target, async (msg) => {
-          await sock.sendMessage(sender, { text: msg });
-        });
-
         return;
       }
 
-      /* ===== TAMBAH TRANSAKSI ===== */
-
-      if (lower.startsWith("tambah")) {
-        const parts = input.split(" ");
-        if (parts.length < 3) {
-          return sock.sendMessage(sender, {
-            text: "❌ Format: tambah <kategori> <nominal> <opsional deskripsi>",
+      /* ---------- INPUT TRANSAKSI ---------- */
+      if (text.startsWith("+")) {
+        const incomeData = await getIncomeData(sender);
+        if (!incomeData) {
+          await sock.sendMessage(sender, {
+            text: "❗ Set income dulu: set income <jumlah> tabungan <target>",
           });
+          return;
         }
 
-        const kategori = parts[1];
-        const nominal = Number(parts[2]);
-        const deskripsi = parts.slice(3).join(" ");
-
-        if (isNaN(nominal)) {
-          return sock.sendMessage(sender, {
-            text: "❌ Nominal harus angka",
-          });
+        const match = text.substring(1).match(/(.+?)\s+(\d+)(?:\s+(.*))?/);
+        if (!match) {
+          await sock.sendMessage(sender, { text: "❗ Format salah." });
+          return;
         }
 
-        const row = await appendTransaksi(
+        const kategori = match[1].trim();
+        const nominal = parseFloat(match[2]);
+        const deskripsi = (match[3] || "-").trim();
+
+        await appendTransaksi(sender, kategori, nominal, deskripsi);
+
+        await sock.sendMessage(sender, {
+          text: `✅ Dicatat:\n${kategori} - Rp${nominal.toLocaleString()} (${deskripsi})`,
+        });
+        return;
+      }
+
+      /* ---------- SET INCOME ---------- */
+      if (text.toLowerCase().startsWith("set income")) {
+        const match = text.match(/^set income (\d+)\s+tabungan\s+(\d+)/i);
+        if (!match) {
+          await sock.sendMessage(sender, {
+            text: "❗ Contoh: set income 5000000 tabungan 1000000",
+          });
+          return;
+        }
+
+        await setIncome(
           sender,
-          kategori,
-          nominal,
-          deskripsi
+          parseInt(match[1]),
+          parseInt(match[2]),
+          (m) => sock.sendMessage(sender, { text: m })
         );
-
-        return sock.sendMessage(sender, {
-          text:
-`✅ *Transaksi Dicatat*
-📂 ${kategori}
-💸 ${formatRupiah(nominal)}
-📝 ${deskripsi || "-"}`,
-        });
+        return;
       }
 
-      /* ===== REFUND ===== */
-
-      if (lower.startsWith("refund")) {
-        const parts = input.split(" ");
-        if (parts.length < 2) {
-          return sock.sendMessage(sender, {
-            text: "❌ Format: refund <nominal>",
-          });
+      /* ---------- PROGRESS ---------- */
+      if (text.toLowerCase() === "progress tabungan") {
+        const incomeData = await getIncomeData(sender);
+        if (!incomeData) {
+          await sock.sendMessage(sender, { text: "❗ Income belum diset." });
+          return;
         }
 
-        const nominal = Number(parts[1]);
-        if (isNaN(nominal)) {
-          return sock.sendMessage(sender, {
-            text: "❌ Nominal harus angka",
-          });
-        }
+        const income = Number(incomeData.IncomeBulan || 0);
+        const target = Number(incomeData.TargetTabungan || 0);
+        const keluar = await getTotalPengeluaranBulanIni(sender);
 
-        const transaksi = await laporanHariIni(sender);
-        const target = transaksi
-          .slice()
-          .reverse()
-          .find((t) => t.Nominal === nominal);
+        const tabungan = income - keluar;
 
-        if (!target) {
-          return sock.sendMessage(sender, {
-            text: "❌ Transaksi tidak ditemukan",
-          });
-        }
-
-        await hapusTransaksiRow(target);
-
-        return sock.sendMessage(sender, {
+        await sock.sendMessage(sender, {
           text:
-`↩️ *Refund Berhasil*
-💸 ${formatRupiah(nominal)}`,
-        });
-      }
-
-      /* ===== LAPORAN HARI INI ===== */
-
-      if (lower === "hari ini") {
-        const data = await laporanHariIni(sender);
-        if (data.length === 0) {
-          return sock.sendMessage(sender, {
-            text: "📭 Belum ada transaksi hari ini",
-          });
-        }
-
-        let total = 0;
-        let msg = "📊 *Pengeluaran Hari Ini*\n\n";
-
-        data.forEach((r, i) => {
-          total += r.Nominal;
-          msg += `${i + 1}. ${r.Kategori} - ${formatRupiah(r.Nominal)}\n`;
-        });
-
-        msg += `\n💸 Total: ${formatRupiah(total)}`;
-
-        return sock.sendMessage(sender, { text: msg });
-      }
-
-      /* ===== LAPORAN BULAN INI ===== */
-
-      if (lower === "bulan ini") {
-        const income = await getIncomeData(sender);
-        if (!income) {
-          return sock.sendMessage(sender, {
-            text: "❌ Income bulan ini belum diset",
-          });
-        }
-
-        const total = await getTotalPengeluaranBulanIni(sender);
-        const tabungan = income.IncomeBulan - total;
-
-        return sock.sendMessage(sender, {
-          text:
-`📈 *Ringkasan Bulan Ini*
-
-💰 Income: ${formatRupiah(income.IncomeBulan)}
-💸 Pengeluaran: ${formatRupiah(total)}
-💼 Tabungan: ${formatRupiah(tabungan)}
-🎯 Target: ${formatRupiah(income.TargetTabungan)}`,
-        });
-      }
-
-      /* ===== ANALISIS BOROS ===== */
-
-      if (lower === "analisis boros") {
-        const income = await getIncomeData(sender);
-        if (!income) {
-          return sock.sendMessage(sender, {
-            text: "❌ Income bulan ini belum diset",
-          });
-        }
-
-        const data = await laporanHariIni(sender);
-        const total = data.reduce((a, r) => a + r.Nominal, 0);
-
-        let status = "✅ Aman";
-        if (total > income.MaxHarian) status = "⚠️ Melebihi limit harian";
-
-        return sock.sendMessage(sender, {
-          text:
-`📉 *Analisis Hari Ini*
-💸 Total: ${formatRupiah(total)}
-🎯 Limit: ${formatRupiah(income.MaxHarian)}
-
-Status: ${status}`,
+            `📊 *Progress Bulan Ini*\n\n` +
+            `Income: Rp${income.toLocaleString()}\n` +
+            `Pengeluaran: Rp${keluar.toLocaleString()}\n` +
+            `Tabungan: Rp${tabungan.toLocaleString()}\n` +
+            `Target: Rp${target.toLocaleString()}`,
         });
       }
     } catch (err) {
-      console.error("❌ ERROR:", err);
+      console.error("❌ Message error:", err);
+      await sock.sendMessage(sender, {
+        text: "❗ Terjadi kesalahan. Coba lagi.",
+      });
     }
   });
 
-  /* ================= SCHEDULER ================= */
-
-  schedule.scheduleJob("0 0 21 * * *", async () => {
-    try {
-      const income = await getIncomeData(OWNER_JID);
-      if (!income) return;
-
-      const data = await laporanHariIni(OWNER_JID);
-      const total = data.reduce((a, r) => a + r.Nominal, 0);
-      const sisa = income.MaxHarian - total;
-
-      await sock.sendMessage(OWNER_JID, {
-        text:
-`📊 *Ringkasan Harian*
-🗓 ${dayjs().tz(TZ).format("DD MMMM YYYY")}
-
-💸 Total: ${formatRupiah(total)}
-🎯 Limit: ${formatRupiah(income.MaxHarian)}
-👛 Sisa: ${formatRupiah(sisa)}`,
-      });
-    } catch (e) {
-      console.error("Scheduler error:", e);
-    }
+  /* ================= SCHEDULE ================= */
+  schedule.scheduleJob("0 0 15 * * *", async () => {
+    console.log("⏰ Reminder job running...");
+    await broadcastReminderPengeluaran(sock);
   });
 }
 
+/* ======================================================
+ * BOOT
+ * ====================================================== */
 startBot();
